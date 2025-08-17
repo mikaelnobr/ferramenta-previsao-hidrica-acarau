@@ -1,0 +1,16 @@
+{
+  "estacoes": {
+    "35235000-VARZEA DO GROSSO.csv": {
+      "distancia_km": 8.1
+    },
+    "35255000-SIARAO.csv": {
+      "distancia_km": 34.9
+    },
+    "35275000-SOBRAL.csv": {
+      "distancia_km": 59.8
+    },
+    "35283000-SANTANA DO ACARAU.csv": {
+      "distancia_km": 88.3
+    }
+  }
+}
