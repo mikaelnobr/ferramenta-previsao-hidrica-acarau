@@ -1,243 +1,187 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
 import json
 import joblib
 import os
-import streamlit as st
 from tensorflow.keras.models import load_model # type: ignore
 import plotly.graph_objects as go
 from datetime import timedelta
 
-# --- CONFIGURAÇÃO INICIAL E CARREGAMENTO DE ARTEFATOS ---
 st.set_page_config(page_title="Gestão Hídrica Acaraú", layout="wide")
 
 @st.cache_resource
 def carregar_tudo():
-    """Carrega modelos, scalers e configurações de uma vez."""
     try:
-        with open('config.json', 'r', encoding='utf-8') as f:
-            config = json.load(f)
+        with open('config.json', 'r', encoding='utf-8') as f: config = json.load(f)
     except FileNotFoundError:
-        st.error("ERRO CRÍTICO: Arquivo 'config.json' não foi encontrado na raiz do projeto.")
-        return None, None, None
+        st.error("ERRO CRÍTICO: 'config.json' não foi encontrado."); return None, None
     
     modelos, scalers = {}, {}
     for cenario in ['baixo', 'medio', 'alto']:
-        if os.path.exists(f'models/modelo_{cenario}.h5') and os.path.exists(f'models/scaler_{cenario}.pkl'):
+        if os.path.exists(f'models/modelo_{cenario}.h5'):
             modelos[cenario] = load_model(f'models/modelo_{cenario}.h5')
             scalers[cenario] = joblib.load(f'models/scaler_{cenario}.pkl')
             
     return config, modelos, scalers
 
 config, modelos, scalers = carregar_tudo()
-if config:
-    estacoes_info = config.get('estacoes', {})
+if config: estacoes_info = config.get('estacoes', {})
 N_PAST = 30 
 
-# --- FUNÇÕES DE BACKEND ---
-
 def processar_arquivos_brutos(arquivos_carregados, estacoes_info):
-    """Processa os arquivos CSV brutos carregados pelo usuário em memória."""
-    with st.spinner("Processando e limpando os dados brutos..."):
-        lista_dfs_estacoes = []
-        mapa_arquivos_carregados = {f.name: f for f in arquivos_carregados}
-
-        for nome_arquivo_esperado, info in estacoes_info.items():
-            if nome_arquivo_esperado not in mapa_arquivos_carregados:
-                st.error(f"Arquivo necessário não encontrado: '{nome_arquivo_esperado}'.")
-                return None
-            
-            arquivo = mapa_arquivos_carregados[nome_arquivo_esperado]
-            st.write(f"  Lendo arquivo: {arquivo.name}")
+    with st.spinner("Processando dados..."):
+        lista_dfs = []
+        mapa_arquivos = {f.name: f for f in arquivos_carregados}
+        for nome_arq, info in estacoes_info.items():
+            if nome_arq not in mapa_arquivos:
+                st.error(f"Arquivo não encontrado: '{nome_arq}'."); return None
+            arquivo = mapa_arquivos[nome_arq]
             try:
-                df_estacao = pd.read_csv(arquivo, encoding='latin-1', sep=';')
-                if 'Data' not in df_estacao.columns or 'Hora' not in df_estacao.columns:
-                    df_estacao = pd.read_csv(arquivo, encoding='latin-1', sep=',')
+                df = pd.read_csv(arquivo, encoding='latin-1', sep=';', thousands=',')
+                if 'Data' not in df.columns: df = pd.read_csv(arquivo, encoding='latin-1', sep=',', thousands=',')
             except Exception as e:
-                st.error(f"Erro ao ler o arquivo {arquivo.name}: {e}")
-                return None
-
-            id_estacao = nome_arquivo_esperado.replace('.csv', '').lower().replace(' ', '_').replace('-', '_')
-
-            colunas_reais = {'Chuva (mm)': f'chuva_{id_estacao}', 'Nível (cm)': f'nivel_{id_estacao}', 'Vazão (m3/s)': f'vazao_{id_estacao}'}
-            for col_original, col_nova in colunas_reais.items():
-                if col_original in df_estacao.columns:
-                    df_estacao[col_nova] = df_estacao[col_original].astype(str).str.strip()
-            
-            df_estacao['timestamp'] = pd.to_datetime(df_estacao['Data'] + ' ' + df_estacao['Hora'], format='%d/%m/%Y %H:%M:%S', errors='coerce')
-            df_estacao.dropna(subset=['timestamp'], inplace=True)
-            df_estacao = df_estacao.set_index('timestamp')
-            
-            colunas_renomeadas = [col for col in colunas_reais.values() if col in df_estacao.columns]
-            lista_dfs_estacoes.append(df_estacao[colunas_renomeadas])
-            
-        df_consolidado = pd.concat(lista_dfs_estacoes, axis=1)
-        
+                st.error(f"Erro ao ler '{arquivo.name}': {e}"); return None
+            id_estacao = nome_arq.replace('.csv', '').lower().replace(' ', '_').replace('-', '_')
+            df = df.rename(columns={'Chuva (mm)': f'chuva_{id_estacao}', 'Nível (cm)': f'nivel_{id_estacao}', 'Vazão (m3/s)': f'vazao_{id_estacao}'})
+            df['timestamp'] = pd.to_datetime(df['Data'] + ' ' + df['Hora'], format='%d/%m/%Y %H:%M:%S', errors='coerce')
+            df.dropna(subset=['timestamp'], inplace=True)
+            df = df.set_index('timestamp')
+            cols_renomeadas = [c for c in df.columns if any(s in c for s in ['chuva', 'nivel', 'vazao'])]
+            lista_dfs.append(df[cols_renomeadas])
+        df_consolidado = pd.concat(lista_dfs, axis=1)
         agg_funcs = {}
-        for nome_arquivo in estacoes_info.keys():
-            id_estacao = nome_arquivo.replace('.csv', '').lower().replace(' ', '_').replace('-', '_')
-            for tipo_dado in ['chuva', 'nivel', 'vazao']:
-                coluna = f'{tipo_dado}_{id_estacao}'
-                if coluna in df_consolidado.columns:
-                    df_consolidado[coluna] = pd.to_numeric(df_consolidado[coluna].astype(str).str.replace(',', '.'), errors='coerce')
-                    if tipo_dado != 'chuva':
-                        df_consolidado[coluna] = df_consolidado[coluna].interpolate(method='linear')
-                    else:
-                        df_consolidado[coluna] = df_consolidado[coluna].fillna(0)
-                    agg_funcs[coluna] = 'sum' if tipo_dado == 'chuva' else 'mean'
-                
+        for nome_arq, info in estacoes_info.items():
+            id_estacao = nome_arq.replace('.csv', '').lower().replace(' ', '_').replace('-', '_')
+            for tipo in ['chuva', 'nivel', 'vazao']:
+                col = f'{tipo}_{id_estacao}'
+                if col in df_consolidado.columns:
+                    df_consolidado[col] = pd.to_numeric(df_consolidado[col], errors='coerce')
+                    df_consolidado[col] = df_consolidado[col].interpolate(method='linear') if tipo != 'chuva' else df_consolidado[col].fillna(0)
+                    agg_funcs[col] = 'sum' if tipo == 'chuva' else 'mean'
         df_diario = df_consolidado.resample('D').agg(agg_funcs)
-        
         for col in df_diario.columns:
-            if 'chuva' not in col:
-                df_diario[col] = df_diario[col].interpolate(method='linear')
+            if 'chuva' not in col: df_diario[col] = df_diario[col].interpolate(method='linear')
         df_diario.fillna(0, inplace=True)
-
-        for nome_arquivo, info in estacoes_info.items():
-            id_estacao = nome_arquivo.replace('.csv', '').lower().replace(' ', '_').replace('-', '_')
+        dia_do_ano = df_diario.index.dayofyear
+        df_diario['dia_sin'] = np.sin(2 * np.pi * dia_do_ano / 366.0)
+        df_diario['dia_cos'] = np.cos(2 * np.pi * dia_do_ano / 366.0)
+        for nome_arq, info in estacoes_info.items():
+            id_estacao = nome_arq.replace('.csv', '').lower().replace(' ', '_').replace('-', '_')
             df_diario[f'distancia_{id_estacao}'] = info['distancia_km']
-        
-        st.success(f"Dados brutos processados com sucesso! Total de dias: {len(df_diario)}")
         return df_diario
 
-def fazer_previsao_futura(df_input, modelo, scaler, dias_para_prever):
+def fazer_previsao_futura(df_input_real, modelo, scaler, dias_para_prever):
     ordem_colunas = scaler.feature_names_in_
-    df_input = df_input.reindex(columns=ordem_colunas)
-    dados_normalizados = scaler.transform(df_input)
+    df_transformed = df_input_real.copy()
+
+    # PASSO 1: Transforma os dados de entrada para a escala LOG, assim como no treino
+    vazao_cols = [col for col in df_transformed.columns if 'vazao' in col]
+    for col in vazao_cols:
+        df_transformed[col] = np.log1p(df_transformed[col])
     
+    df_transformed = df_transformed.reindex(columns=ordem_colunas)
+    dados_normalizados = scaler.transform(df_transformed)
     input_atual = dados_normalizados[-N_PAST:].reshape(1, N_PAST, dados_normalizados.shape[1])
     previsoes_normalizadas = []
-    
     progresso = st.progress(0, text="Calculando previsões...")
+    datas_previsao = pd.date_range(start=df_input_real.index.max() + timedelta(days=1), periods=dias_para_prever)
+    
     for i in range(dias_para_prever):
-        previsao = modelo.predict(input_atual, verbose=0)
-        previsoes_normalizadas.append(previsao[0])
-        
+        previsao_completa = modelo.predict(input_atual, verbose=0)
+        previsoes_normalizadas.append(previsao_completa[0])
         novo_registro = input_atual[0, -1, :].copy()
-        target_indices = [list(ordem_colunas).index(col) for col in ordem_colunas if 'vazao' in col]
+        dia_futuro = datas_previsao[i].dayofyear
+        novo_registro[list(ordem_colunas).index('dia_sin')] = np.sin(2 * np.pi * dia_futuro / 366.0)
+        novo_registro[list(ordem_colunas).index('dia_cos')] = np.cos(2 * np.pi * dia_futuro / 366.0)
+        target_indices = [list(ordem_colunas).index(c) for c in ordem_colunas if any(s in c for s in ['chuva', 'nivel', 'vazao'])]
         for j, idx in enumerate(target_indices):
-            novo_registro[idx] = previsao[0][j]
-            
+            novo_registro[idx] = previsao_completa[0][j]
         input_atual = np.append(input_atual[:, 1:, :], [[novo_registro]], axis=1)
         progresso.progress((i + 1) / dias_para_prever, text=f"Calculando dia {i+1}/{dias_para_prever}")
-
+        
     progresso.empty()
-    dummy_array = np.zeros((len(previsoes_normalizadas), len(ordem_colunas)))
-    for i, idx in enumerate(target_indices):
-        dummy_array[:, idx] = [p[i] for p in previsoes_normalizadas]
+    previsoes_normalizadas = np.array(previsoes_normalizadas)
 
-    previsoes_desnormalizadas = scaler.inverse_transform(dummy_array)
-    return previsoes_desnormalizadas[:, target_indices]
+    # PASSO 2: Desnormaliza para a escala LOG
+    dummy_array = np.zeros((dias_para_prever, len(ordem_colunas)))
+    target_indices_previsao = [list(ordem_colunas).index(c) for c in ordem_colunas if any(s in c for s in ['chuva', 'nivel', 'vazao'])]
+    for j, idx in enumerate(target_indices_previsao):
+        dummy_array[:, idx] = previsoes_normalizadas[:, j]
+    previsoes_desnormalizadas_log = scaler.inverse_transform(dummy_array)
+    
+    # PASSO 3: Cria um DataFrame temporário na escala LOG
+    df_previsoes_log = pd.DataFrame(previsoes_desnormalizadas_log, columns=ordem_colunas, index=datas_previsao)
+    
+    # PASSO 4: Reverte a transformação LOG para obter os valores REAIS
+    df_previsoes_real = df_previsoes_log.copy()
+    for col in vazao_cols:
+        df_previsoes_real[col] = np.expm1(df_previsoes_log[col])
+    
+    df_previsoes_real.clip(lower=0, inplace=True)
+    return df_previsoes_real
 
+# ... O resto do seu código (interpolar_vazao, convert_df_to_csv, e a interface) permanece o mesmo ...
 def interpolar_vazao(data_alvo, previsoes_df, estacoes_info):
     distancias = np.array([info['distancia_km'] for info in estacoes_info.values()])
-    vazoes = previsoes_df.loc[data_alvo].values
-    
+    vazoes_previstas = [f'vazao_{k.replace(".csv", "").lower().replace(" ", "_").replace("-", "_")}' for k in estacoes_info.keys()]
+    vazoes = previsoes_df.loc[data_alvo, vazoes_previstas].values
     idx_sorted = np.argsort(distancias)
-    distancias_sorted = distancias[idx_sorted]
-    vazoes_sorted = vazoes[idx_sorted]
-    
-    return lambda dist_km: np.interp(dist_km, distancias_sorted, vazoes_sorted)
+    return lambda dist_km: np.interp(dist_km, distancias[idx_sorted], vazoes[idx_sorted])
 
 @st.cache_data
 def convert_df_to_csv(df):
-    """Função para converter o DataFrame para CSV, formatado para Excel em português."""
     return df.to_csv(index=True, index_label='Data', sep=';', decimal=',').encode('utf-8-sig')
 
-# --- INTERFACE DO USUÁRIO ---
 st.title("💧 Ferramenta Preditiva para Gestão Hídrica - Vale do Acaraú")
-
 if not modelos:
-    st.error("Nenhum modelo treinado foi encontrado na pasta 'models/'. Execute '2treinamento.py' primeiro.")
+    st.error("Nenhum modelo treinado foi encontrado.")
 else:
     st.sidebar.header("Etapa 1: Previsão Geral")
-    mapa_cenarios_display = {'Baixa Precipitação': 'baixo', 'Média Precipitação': 'medio', 'Alta Precipitação': 'alto'}
-    cenarios_disponiveis = [key for key, val in mapa_cenarios_display.items() if val in modelos]
-    cenario_display = st.sidebar.selectbox("1. Selecione o cenário climático:", cenarios_disponiveis)
-    cenario_cod = mapa_cenarios_display[cenario_display]
-
-    dados_brutos_files = st.sidebar.file_uploader(
-        "2. Carregue os 4 arquivos CSV BRUTOS das estações:", 
-        type="csv", 
-        accept_multiple_files=True,
-        help=f"Os nomes dos arquivos devem ser: {', '.join(estacoes_info.keys())}"
-    )
-
+    mapa_cenarios = {'Baixa Precipitação': 'baixo', 'Média Precipitação': 'medio', 'Alta Precipitação': 'alto'}
+    cenarios_disp = [k for k, v in mapa_cenarios.items() if v in modelos]
+    cenario_display = st.sidebar.selectbox("1. Selecione o cenário:", cenarios_disp)
+    cenario_cod = mapa_cenarios[cenario_display]
+    dados_brutos = st.sidebar.file_uploader("2. Carregue os 4 arquivos CSV BRUTOS:", type="csv", accept_multiple_files=True, help=f"Nomes: {', '.join(estacoes_info.keys())}")
     if st.sidebar.button("Gerar Previsão", type="primary"):
-        if dados_brutos_files and len(dados_brutos_files) == len(estacoes_info):
-            dados_historicos_processados = processar_arquivos_brutos(dados_brutos_files, estacoes_info)
-            
-            if dados_historicos_processados is not None:
-                st.session_state.dados_historicos = dados_historicos_processados
-                
-                if len(dados_historicos_processados) < N_PAST:
-                    st.error(f"Erro: Os dados resultaram em menos de {N_PAST} dias. Verifique os arquivos.")
+        if dados_brutos and len(dados_brutos) == len(estacoes_info):
+            dados_hist = processar_arquivos_brutos(dados_brutos, estacoes_info)
+            if dados_hist is not None:
+                st.session_state.dados_historicos = dados_hist
+                if len(dados_hist) < N_PAST:
+                    st.error(f"Erro: Dados insuficientes (< {N_PAST} dias).")
                 else:
-                    modelo_ativo, scaler_ativo = modelos[cenario_cod], scalers[cenario_cod]
-                    data_final = dados_historicos_processados.index.max()
-                    dias_para_prever = (pd.to_datetime(f"{data_final.year}-12-31") - data_final).days
-                    
-                    if dias_para_prever > 0:
-                        previsoes_vazao = fazer_previsao_futura(dados_historicos_processados, modelo_ativo, scaler_ativo, dias_para_prever)
-                        datas_previsao = pd.date_range(start=data_final + timedelta(days=1), periods=dias_para_prever)
-                        colunas_vazao = [col for col in scaler_ativo.feature_names_in_ if 'vazao' in col]
-                        st.session_state.df_previsoes = pd.DataFrame(previsoes_vazao, index=datas_previsao, columns=colunas_vazao)
+                    modelo, scaler = modelos[cenario_cod], scalers[cenario_cod]
+                    data_final = dados_hist.index.max()
+                    dias_a_prever = (pd.to_datetime(f"{data_final.year}-12-31") - data_final).days
+                    if dias_a_prever > 0:
+                        st.session_state.df_previsoes = fazer_previsao_futura(dados_hist, modelo, scaler, dias_a_prever)
                     else:
-                        st.warning("Os dados fornecidos já cobrem todo o ano.")
+                        st.warning("Dados já cobrem todo o ano.")
                         if 'df_previsoes' in st.session_state: del st.session_state['df_previsoes']
         else:
-            st.sidebar.warning(f"Por favor, carregue os {len(estacoes_info)} arquivos CSV das estações.")
-
-    # --- ÁREA DE RESULTADOS ---
-    if 'df_previsoes' in st.session_state and 'dados_historicos' in st.session_state:
+            st.sidebar.warning(f"Por favor, carregue os {len(estacoes_info)} arquivos.")
+    if 'df_previsoes' in st.session_state:
         st.header("📈 Gráfico de Previsões de Vazão")
-        df_previsoes = st.session_state.df_previsoes
-        dados_historicos = st.session_state.dados_historicos
-        
+        df_previsoes, dados_hist = st.session_state.df_previsoes, st.session_state.dados_historicos
+        vazao_cols = [c for c in df_previsoes.columns if 'vazao' in c]
         fig = go.Figure()
         cores = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
-        
-        for i, col in enumerate(df_previsoes.columns):
-            id_estacao_limpo = col.replace('vazao_', '').replace('_', ' ').title()
-            fig.add_trace(go.Scatter(x=dados_historicos.index, y=dados_historicos[col], mode='lines', name=f'Histórico {id_estacao_limpo}', line=dict(color=cores[i%len(cores)])))
-            fig.add_trace(go.Scatter(x=df_previsoes.index, y=df_previsoes[col], mode='lines', name=f'Previsão {id_estacao_limpo}', line=dict(color=cores[i%len(cores)], dash='dash')))
-
-        fig.update_layout(title_text="Vazão Histórica e Prevista para as Estações", xaxis_title="Data", yaxis_title="Vazão (m³/s)")
+        for i, col in enumerate(vazao_cols):
+            nome_limpo = col.replace('vazao_', '').replace('_', ' ').title()
+            fig.add_trace(go.Scatter(x=dados_hist.index, y=dados_hist[col], mode='lines', name=f'Histórico {nome_limpo}', line=dict(color=cores[i%len(cores)])))
+            fig.add_trace(go.Scatter(x=df_previsoes.index, y=df_previsoes[col], mode='lines', name=f'Previsão {nome_limpo}', line=dict(color=cores[i%len(cores)], dash='dash')))
+        fig.update_layout(title_text="Vazão Histórica e Prevista", xaxis_title="Data", yaxis_title="Vazão (m³/s)")
         st.plotly_chart(fig, use_container_width=True)
-        
-        csv_data = convert_df_to_csv(df_previsoes)
-        st.download_button(
-           label="📥 Baixar Dados da Previsão (CSV)",
-           data=csv_data,
-           file_name=f"previsao_vazao_{cenario_cod}.csv",
-           mime="text/csv",
-        )
-        
-        # =========================================================================== #
-        # !!! INTERFACE FINAL CORRIGIDA, COM LIMITES DINÂMICOS !!!                  #
-        # =========================================================================== #
+        csv_data = convert_df_to_csv(df_previsoes[vazao_cols])
+        st.download_button(label="📥 Baixar Previsão (CSV)", data=csv_data, file_name=f"previsao_{cenario_cod}.csv", mime="text/csv")
         st.sidebar.header("Etapa 2: Análise Específica")
-        
-        # Pega a primeira e a última distância para definir os limites do slider
         distancias = sorted([info['distancia_km'] for info in estacoes_info.values()])
         dist_min, dist_max = min(distancias), max(distancias)
-        
         data_min, data_max = df_previsoes.index.min().date(), df_previsoes.index.max().date()
-        
-        data_consulta = st.sidebar.date_input("1. Selecione uma data futura:", min_value=data_min, max_value=data_max, value=data_min)
-        
-        distancia_consulta = st.sidebar.slider(
-            "2. Selecione a distância do Açude (km):", 
-            min_value=dist_min, 
-            max_value=dist_max, 
-            value=dist_min, # Começa no valor mínimo
-            step=0.5
-        )
-        
-        st.sidebar.caption(f"Nota: A previsão só é válida entre {dist_min} km e {dist_max} km, que são os limites das estações.")
-        
-        if st.sidebar.button("Consultar Vazão Específica"):
-            # Usa a função de interpolação segura
-            funcao_calculo = interpolar_vazao(pd.to_datetime(data_consulta), df_previsoes, estacoes_info)
-            vazao_calculada = funcao_calculo(distancia_consulta)
-            st.sidebar.metric(label=f"Vazão em {data_consulta.strftime('%d/%m/%Y')} a {distancia_consulta} km", value=f"{vazao_calculada:.2f} m³/s")
+        data_consulta = st.sidebar.date_input("1. Data da consulta:", min_value=data_min, max_value=data_max, value=data_min)
+        dist_consulta = st.sidebar.slider("2. Distância do Açude (km):", min_value=dist_min, max_value=dist_max, value=dist_min, step=0.5)
+        st.sidebar.caption(f"Previsão válida entre {dist_min} km e {dist_max} km.")
+        if st.sidebar.button("Consultar Vazão"):
+            vazao_calc = interpolar_vazao(pd.to_datetime(data_consulta), df_previsoes, estacoes_info)(dist_consulta)
+            st.sidebar.metric(label=f"Vazão em {data_consulta.strftime('%d/%m/%Y')} a {dist_consulta} km", value=f"{vazao_calc:.2f} m³/s")
